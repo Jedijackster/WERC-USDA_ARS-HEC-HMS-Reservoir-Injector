@@ -1,0 +1,4 @@
+Name,Canvas_X,Canvas_Y,Downstream_Element,Initial_Elev
+Reservoir_North,-84344,1044292,Junction_1,105.5
+Reservoir_South,32.43051,-100.94794,Reach_2,98
+Reservoir1,32.44662,-96.99527,Reach_2,90
