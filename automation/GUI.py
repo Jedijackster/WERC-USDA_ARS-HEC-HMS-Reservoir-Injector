@@ -3,6 +3,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 
+# Import the injection function from automate_hms.py
+try:
+    from automate_hms import automate_reservoir_injection
+except ImportError:
+    automate_reservoir_injection = None
+
 
 def run_injection():
     basin_path = basin_entry.get().strip()
@@ -21,18 +27,25 @@ def run_injection():
         )
         return
 
-    try:
-        # =========================================================================
-        # DROP EXISTING INJECTION LOGIC HERE
-        # e.g., call function: automate_reservoir_injection(basin_path, csv_path)
-        # =========================================================================
+    # Ensure automate_hms.py is present and imported
+    if automate_reservoir_injection is None:
+        messagebox.showerror(
+            "Error",
+            "Could not import 'automate_hms.py'. Ensure 'automate_hms.py' is in the same directory as GUI.py.",
+        )
+        return
 
-        # Placeholder demo output:
+    try:
+        # Call the automation function from automate_hms.py
+        automate_reservoir_injection(basin_path, csv_path)
+
+        # Update GUI status on success
         status_label.config(
             text="Success! Reservoirs injected into basin model.", fg="green"
         )
         messagebox.showinfo(
-            "Success", f"Processed:\nBasin: {basin_path}\nCSV: {csv_path}"
+            "Success",
+            f"Successfully updated and injected reservoirs into:\n\nBasin: {basin_path}\nCSV: {csv_path}",
         )
 
     except Exception as e:
@@ -52,7 +65,7 @@ def browse_basin():
 
 def browse_csv():
     filename = filedialog.askopenfilename(
-        title="Select Reservoirs Data CSV",
+        title="Select Reservoirs CSV File",
         filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
     )
     if filename:
@@ -60,34 +73,38 @@ def browse_csv():
         csv_entry.insert(0, filename)
 
 
-# --- GUI Setup ---
+# --- UI Layout Setup ---
 root = tk.Tk()
 root.title("HEC-HMS Reservoir Injector")
-root.geometry("650x320")
-root.resizable(True, True)
+root.geometry("620x300")
+root.resizable(False, False)
 
-# Main Frame
 frame = tk.Frame(root, padx=15, pady=15)
 frame.pack(fill=tk.BOTH, expand=True)
 
-# --- Header Section (Logo + Title) ---
+# --- Header Frame (Logo + Title) ---
 header_frame = tk.Frame(frame)
-header_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 15))
+header_frame.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 15))
 
-# Load & Display WERC Logo
-logo_img = None
-logo_path = "image_99e4bd.png"  # Matche local image filename
-
+# Optional Logo Handling
+logo_path = "logo.png"  # Replace or remove if logo is not used
 if os.path.exists(logo_path):
-    raw_img = Image.open(logo_path)
-    # Resize keeping aspect ratio (height set to 60px)
-    aspect_ratio = raw_img.width / raw_img.height
-    new_width = int(60 * aspect_ratio)
-    resized_img = raw_img.resize((new_width, 60), Image.Resampling.LANCZOS)
-    logo_img = ImageTk.PhotoImage(resized_img)
+    try:
+        raw_img = Image.open(logo_path)
+        
+        aspect_ratio = raw_img.width / raw_img.height
+        new_width = int(60 * aspect_ratio)
+        resized_img = raw_img.resize((new_width, 60), Image.Resampling.LANCZOS)
+        
+        logo_img = ImageTk.PhotoImage(resized_img)
 
-    logo_label = tk.Label(header_frame, image=logo_img)
-    logo_label.pack(side=tk.LEFT, padx=(0, 12))
+        logo_label = tk.Label(header_frame, image=logo_img)
+        
+        
+        logo_label.image = logo_img  # Keep a reference
+        logo_label.pack(side=tk.LEFT, padx=(0, 12))
+    except Exception:
+        pass
 
 title_label = tk.Label(
     header_frame,
@@ -96,7 +113,6 @@ title_label = tk.Label(
     anchor="w",
 )
 title_label.pack(side=tk.LEFT, fill=tk.Y)
-
 
 # --- File Selection Fields ---
 
@@ -118,19 +134,20 @@ csv_entry.grid(row=4, column=0, padx=(0, 5), pady=(0, 10))
 btn_csv = tk.Button(frame, text="Browse...", command=browse_csv)
 btn_csv.grid(row=4, column=1, pady=(0, 10))
 
-# --- Action & Status ---
-btn_run = tk.Button(
+# --- Action Button & Status ---
+run_btn = tk.Button(
     frame,
     text="Run Injection",
     command=run_injection,
-    bg="#2c3e50",
+    bg="#007ACC",
     fg="white",
     font=("Helvetica", 10, "bold"),
-    pady=4,
+    padx=10,
+    pady=3,
 )
-btn_run.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 5))
+run_btn.grid(row=5, column=0, columnspan=2, pady=(10, 5))
 
 status_label = tk.Label(frame, text="", font=("Helvetica", 9, "italic"))
-status_label.grid(row=6, column=0, columnspan=2, pady=(5, 0))
+status_label.grid(row=6, column=0, columnspan=2)
 
 root.mainloop()
