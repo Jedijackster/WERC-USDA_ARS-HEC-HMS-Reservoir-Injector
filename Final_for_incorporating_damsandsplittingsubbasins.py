@@ -5,22 +5,17 @@ hms_dam_split_full.py
 End-to-end pipeline: split HEC-HMS subbasins at NID dams using the model's
 own terrain rasters, insert Reservoirs into the basin file at snapped dam locations,
 and link Elevation-Storage curves (Columns B and F) extracted from curves.zip.
-
-Per dam D (snapped to the stream network, inside the watershed):
-    new Subbasin = D's upstream area inside its containing subbasin,
-                   minus any upstream dam pieces (incremental)  -> node(D)
-    node(D)      = Reservoir named after the dam (with linked Elevation-Storage Table)
-                   -> node(first dam downstream)  if the trace hits one
-                   -> original Downstream of the containing subbasin, else
-Original subbasins keep their element name; only their Area is reduced to
-the residual. New-subbasin params are CLONED from the parent - regenerate
-area-dependent terms (Snyder Tp, CN, ...) afterwards.
 """
 
 import os
 import re
 import zipfile
+import time
 from collections import deque
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import sys
+import webbrowser
 
 import numpy as np
 import pandas as pd
@@ -32,11 +27,18 @@ from shapely.geometry import Point, LineString, MultiPolygon, shape
 from shapely.ops import unary_union
 from pyproj import CRS as PyProjCRS
 
+# OpenCV and Pillow for Video Splash
+import cv2
+from PIL import Image, ImageTk
+
 # =====================================================================
-# CONFIG
+# CONFIG (Default Fallback Paths)
 # =====================================================================
 CONFIG = {
-    # ---- inputs -----------------------------------------------------
+    # ---- default inputs ---------------------------------------------
+    "splash_video":  r"splash.mp4",     # Path to your splash video
+    "werc_logo":     r"werc_logo.png",   # Path to WERC logo image
+    "usda_logo":     r"usda_logo.png",   # Path to USDA ARS logo image
     "subbasins_shp": r"./subbasins/subbasins.shp",
     "basin_file":    r"BKR_2016_100yr.basin",
     "dams_shp":      r"./NID_Dams_merged/NID_Dams_merged.shp",
@@ -45,7 +47,16 @@ CONFIG = {
     "flowdir_name":   "flowdir",
     "flowaccum_name": "flowaccum",
     "streams_name":   "streams",
-
+    
+    # ---- Logos and URLs ------------------------------------------------
+    "splash_video":  r"splash.mp4",     
+    "werc_logo":     r"werc_logo.png",   
+    "usda_logo":     r"usda_logo.png",
+    
+    # ---- website URLs -----------------------------------------------
+    "usda_url":      "https://www.ars.usda.gov/",
+    "werc_url":      "https://werc.uta.edu/",
+    
     # optional WBD catchments for ground-truth validation ("" to skip)
     "wbd_shp": "",
 
@@ -72,6 +83,204 @@ CONFIG = {
     "dam_sub_prefix":  "SUB_",
 }
 
+
+# =====================================================================
+# GUI FILE SELECTOR DIALOG WITH SPLASH VIDEO & LOGOS
+# =====================================================================
+def prompt_user_for_files(config):
+    """
+    Opens a GUI window. First plays `splash.mp4`, performs a smooth fade-to-white,
+    and then displays the input file selection controls with logos on the top right.
+    """
+    root = tk.Tk()
+    root.title("HEC-HMS Dam Splitter")
+    root.configure(bg="white")
+
+    video_path = config.get("splash_video", "splash.mp4")
+
+    # If splash video exists, play video sequence inside the window
+    if os.path.exists(video_path):
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 60
+        delay = int(100 / fps)
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 680
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 420
+
+        root.geometry(f"{max(width, 680)}x{max(height, 420)}")
+        
+        video_label = tk.Label(root, bg="white")
+        video_label.pack(fill="both", expand=True)
+
+        last_frame = None
+
+        # 1. Play Video
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            last_frame = frame.copy()
+            # Convert BGR to RGB
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb_frame)
+            imgtk = ImageTk.PhotoImage(image=img)
+            
+            video_label.imgtk = imgtk
+            video_label.configure(image=imgtk)
+            root.update()
+            time.sleep(delay / 1000.0)
+
+        cap.release()
+
+        # 2. Fade to White Animation
+        if last_frame is not None:
+            steps = 20
+            white_screen = np.full_like(last_frame, 255, dtype=np.uint8)
+            for alpha in np.linspace(0, 1, steps):
+                blended = cv2.addWeighted(last_frame, 1 - alpha, white_screen, alpha, 0)
+                rgb_blended = cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(rgb_blended)
+                imgtk = ImageTk.PhotoImage(image=img)
+                
+                video_label.imgtk = imgtk
+                video_label.configure(image=imgtk)
+                root.update()
+                time.sleep(0.02)
+
+        # Remove video canvas label after animation
+        video_label.destroy()
+    else:
+        print(f"[Info] Splash video '{video_path}' not found. Skipping intro animation.")
+
+    # 3. Setup File Selection GUI Controls
+    root.geometry("700x440")
+    root.resizable(True, True)
+
+    # Top Header Frame for Title and Logos
+    header_frame = tk.Frame(root, bg="white", padx=15, pady=10)
+    header_frame.pack(fill="x", side="top")
+
+    # Title on top left
+    title_label = tk.Label(header_frame, text="HEC-HMS Dam Splitter", bg="white", font=("Arial", 14, "bold"))
+    title_label.pack(side="left", anchor="w")
+
+    def open_url(url):
+        webbrowser.open_new_tab(url)
+
+    # -----------------------------------------------------------------
+    # Container for Logos on the top right
+    # -----------------------------------------------------------------
+    logo_frame = tk.Frame(header_frame, bg="white")
+    logo_frame.pack(side="right", anchor="e")
+
+    # Helper function to resize and create PhotoImage
+    def load_logo(path, max_height=45):
+        if os.path.exists(path):
+            try:
+                img = Image.open(path)
+                aspect_ratio = img.width / img.height
+                new_width = int(max_height * aspect_ratio)
+                img = img.resize((new_width, max_height), Image.Resampling.LANCZOS)
+                return ImageTk.PhotoImage(img)
+            except Exception as e:
+                print(f"[Warning] Failed to load logo '{path}': {e}")
+        return None
+
+    # Load images with sizing
+    usda_img = load_logo(config.get("usda_logo", "usda_logo.png"), max_height=68)
+    werc_img = load_logo(config.get("werc_logo", "werc_logo.png"), max_height=50)
+
+    # USDA ARS Logo Label
+    if usda_img:
+        usda_url = config.get("usda_url", "https://www.ars.usda.gov/")
+        lbl_usda = tk.Label(logo_frame, image=usda_img, bg="white", cursor="hand2")
+        lbl_usda.image = usda_img  # Keep reference
+        lbl_usda.pack(side="left", padx=(0, 12))
+        # Bind left-click to open URL
+        lbl_usda.bind("<Button-1>", lambda event, url=usda_url: open_url(url))
+
+    # WERC Logo Label
+    if werc_img:
+        werc_url = config.get("werc_url", "https://werc.uta.edu/")
+        lbl_werc = tk.Label(logo_frame, image=werc_img, bg="white", cursor="hand2")
+        lbl_werc.image = werc_img  # Keep reference
+        lbl_werc.pack(side="left")
+        # Bind left-click to open URL
+        lbl_werc.bind("<Button-1>", lambda event, url=werc_url: open_url(url))
+
+    sub_var = tk.StringVar(value=config.get("subbasins_shp", ""))
+    basin_var = tk.StringVar(value=config.get("basin_file", ""))
+    dams_var = tk.StringVar(value=config.get("dams_shp", ""))
+    curves_var = tk.StringVar(value=config.get("curves_zip", ""))
+    terrain_var = tk.StringVar(value=config.get("terrain_dir", ""))
+
+    def browse_subbasins():
+        f = filedialog.askopenfilename(title="Select Subbasins Shapefile", filetypes=[("Shapefiles", "*.shp"), ("All Files", "*.*")])
+        if f: sub_var.set(f)
+
+    def browse_basin():
+        f = filedialog.askopenfilename(title="Select HEC-HMS Basin File", filetypes=[("Basin Files", "*.basin"), ("All Files", "*.*")])
+        if f: basin_var.set(f)
+
+    def browse_dams():
+        f = filedialog.askopenfilename(title="Select Dams Shapefile", filetypes=[("Shapefiles", "*.shp"), ("All Files", "*.*")])
+        if f: dams_var.set(f)
+
+    def browse_curves():
+        f = filedialog.askopenfilename(title="Select Curves ZIP File", filetypes=[("ZIP Archives", "*.zip"), ("All Files", "*.*")])
+        if f: curves_var.set(f)
+
+    def browse_terrain():
+        d = filedialog.askdirectory(title="Select Terrain Directory (containing flowdir, flowaccum, streams)")
+        if d: terrain_var.set(d)
+
+    def on_run():
+        root.user_submitted = True
+        root.destroy()
+
+    def on_cancel():
+        root.user_submitted = False
+        root.destroy()
+        print("Pipeline cancelled by user.")
+        sys.exit(0)  # Cleanly exit process on cancel/close
+
+    root.user_submitted = False
+    root.protocol("WM_DELETE_WINDOW", on_cancel)
+
+    main_frame = tk.Frame(root, bg="white", padx=15, pady=10)
+    main_frame.pack(fill="both", expand=True)
+
+    rows = [
+        ("Subbasins Shapefile (.shp):", sub_var, browse_subbasins),
+        ("HEC-HMS Basin File (.basin):", basin_var, browse_basin),
+        ("Dams Shapefile (.shp):", dams_var, browse_dams),
+        ("Curves Archive (.zip):", curves_var, browse_curves),
+        ("Terrain Directory:", terrain_var, browse_terrain),
+    ]
+
+    for idx, (label_text, var, cmd) in enumerate(rows):
+        tk.Label(main_frame, text=label_text, anchor="w", bg="white", font=("Arial", 9, "bold")).grid(row=idx, column=0, padx=5, pady=8, sticky="w")
+        tk.Entry(main_frame, textvariable=var, width=50).grid(row=idx, column=1, padx=5, pady=8, sticky="ew")
+        tk.Button(main_frame, text="Browse...", command=cmd, width=10).grid(row=idx, column=2, padx=5, pady=8)
+
+    btn_frame = tk.Frame(main_frame, bg="white")
+    btn_frame.grid(row=len(rows), column=0, columnspan=3, pady=15)
+
+    tk.Button(btn_frame, text="Run Pipeline", command=on_run, bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), width=15).pack(side="left", padx=10)
+    tk.Button(btn_frame, text="Cancel", command=on_cancel, font=("Arial", 10), width=18).pack(side="left", padx=10)
+
+    main_frame.columnconfigure(1, weight=1)
+    root.mainloop()
+
+    if getattr(root, "user_submitted", False):
+        config["subbasins_shp"] = sub_var.get()
+        config["basin_file"]    = basin_var.get()
+        config["dams_shp"]      = dams_var.get()
+        config["curves_zip"]    = curves_var.get()
+        config["terrain_dir"]   = terrain_var.get()
+        print("Updated configuration paths from GUI.")
+
 # =====================================================================
 # D8 SCHEMES  (code -> (drow, dcol); raster row grows downward)
 # =====================================================================
@@ -92,11 +301,6 @@ D8_SCHEMES = {
 # CURVE EXTRACTION (CSVs inside curves.zip: Columns B & F)
 # =====================================================================
 def load_elevation_storage_curves(zip_path):
-    """
-    Parses elevation-storage CSV files from curves.zip.
-    Uses Column B (index 1 = Elevation) and Column F (index 5 = Storage).
-    Returns dict: {dam_id: [(elev1, stor1), (elev2, stor2), ...]}
-    """
     curves = {}
     if not zip_path or not os.path.exists(zip_path):
         print(f"  [Warning] Curves ZIP not found at '{zip_path}'. Skipping curve loading.")
@@ -110,7 +314,6 @@ def load_elevation_storage_curves(zip_path):
                 
                 try:
                     with z.open(name) as f:
-                        # Extract Column B (index 1) and Column F (index 5)
                         df = pd.read_csv(f, usecols=[1, 5], header=0)
                         df.columns = ["elevation", "storage"]
                         df["elevation"] = pd.to_numeric(df["elevation"], errors="coerce")
@@ -126,7 +329,6 @@ def load_elevation_storage_curves(zip_path):
 
 
 def format_table_block(table_name, curve_points):
-    """Formats elevation-storage curve points into HEC-HMS Table block format."""
     lines = [
         f"Table: {table_name}",
         "     Table Type: Elevation-Storage",
@@ -383,7 +585,6 @@ def read_basin_text(path):
 
 
 def parse_basin_subbasins(text):
-    """name -> dict(block, downstream, area, cx, cy)"""
     out = {}
     for m in re.finditer(r"(?ms)^Subbasin: (\S+).*?^End:", text):
         blk = m.group(0)
@@ -448,7 +649,6 @@ def make_subbasin_block(template_block, name, area_mi2, downstream,
 
 
 def make_node_block(node_type, name, xy, downstream, desc, table_name=None):
-    """Formats HEC-HMS node blocks (Reservoir or Junction)."""
     b = (f"{node_type}: {name}\n"
          f"     Description: {desc}\n"
          f"     Canvas X: {xy[0]:.6f}\n"
@@ -539,6 +739,10 @@ def write_vector(gdf, path_no_ext, fmt="shp", layer=None):
 # =====================================================================
 def main():
     C = CONFIG
+    
+    # ---- Launch GUI with Video Intro to select paths ----------------
+    prompt_user_for_files(C)
+
     os.makedirs(C["out_dir"], exist_ok=True)
     fmt = C["vector_format"].lower()
 
