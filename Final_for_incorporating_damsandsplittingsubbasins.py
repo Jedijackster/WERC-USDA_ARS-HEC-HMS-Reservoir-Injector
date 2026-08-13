@@ -3,38 +3,23 @@
 hms_dam_split_full.py
 =====================
 End-to-end pipeline: split HEC-HMS subbasins at NID dams using the model's
-own terrain rasters, and (optionally) write the modified .basin file.
+own terrain rasters, insert Reservoirs into the basin file at snapped dam locations,
+and link Elevation-Storage curves (Columns B and F) extracted from curves.zip.
 
 Per dam D (snapped to the stream network, inside the watershed):
     new Subbasin = D's upstream area inside its containing subbasin,
                    minus any upstream dam pieces (incremental)  -> node(D)
-    node(D)      = Junction named after the dam
+    node(D)      = Reservoir named after the dam (with linked Elevation-Storage Table)
                    -> node(first dam downstream)  if the trace hits one
                    -> original Downstream of the containing subbasin, else
 Original subbasins keep their element name; only their Area is reduced to
 the residual. New-subbasin params are CLONED from the parent - regenerate
 area-dependent terms (Snyder Tp, CN, ...) afterwards.
-
-Built-in safeguards (all automatic):
-    - D8 scheme auto-detected (coverage x on-stream x facc-monotonicity);
-      aborts on a weak call instead of guessing.
-    - Dams snapped to MAX flow accumulation within radius (not nearest cell);
-      unsnapped dams are excluded with a report.
-    - Shapefile <-> basin element name mismatches resolved by canvas-centroid
-      matching (e.g. FlatCk_S001 <-> Subbasin-5).
-    - Optional WBD ground-truth IoU validation.
-    - Main-stem dams flagged when facc-implied drainage area >> in-subbasin
-      piece (upstream subbasins bypass the node - review those manually).
-    - Written .basin is re-parsed: every Downstream must resolve.
-
-Outputs (out_dir):
-    snapped_dams.(shp|gpkg)            proposed_split_subbasins.(shp|gpkg)
-    proposed_dam_nodes.(shp|gpkg)      proposed_reaches.(shp|gpkg)
-    connectivity_check.csv             <basin>_withdams.basin   [optional]
 """
 
 import os
 import re
+import zipfile
 from collections import deque
 
 import numpy as np
@@ -52,31 +37,32 @@ from pyproj import CRS as PyProjCRS
 # =====================================================================
 CONFIG = {
     # ---- inputs -----------------------------------------------------
-    "subbasins_shp": r"C:\Users\devkotab\Documents\USDA_Summer_Project\Duck_Clear\Duck_Clear\gis\subbasins.shp",
-    "basin_file":    r"C:\Users\devkotab\Documents\USDA_Summer_Project\Duck_Clear\Duck_Clear\DCK_2016_100yr.basin",
-    "dams_shp":      r"C:\Users\devkotab\Documents\USDA_Summer_Project\merged_dams\NID_Dams_merged.shp",
-    "terrain_dir":   r"C:\Users\devkotab\Documents\USDA_Summer_Project\Duck_Clear\Duck_Clear\terrain\DUCK_CLEAR\01",
+    "subbasins_shp": r"./subbasins/subbasins.shp",
+    "basin_file":    r"BKR_2016_100yr.basin",
+    "dams_shp":      r"./NID_Dams_merged/NID_Dams_merged.shp",
+    "curves_zip":    r"curves.zip",
+    "terrain_dir":   r"./01",
     "flowdir_name":   "flowdir",
     "flowaccum_name": "flowaccum",
     "streams_name":   "streams",
 
     # optional WBD catchments for ground-truth validation ("" to skip)
-    "wbd_shp": r"C:\Users\devkotab\Documents\USDA_Summer_Project\merged_dams\WBD_merged.shp",
+    "wbd_shp": "",
 
     # ---- fields -----------------------------------------------------
     "dam_id_field":       "NID_ID",
     "subbasin_name_field": "name",
 
     # ---- outputs ----------------------------------------------------
-    "out_dir": r"C:\Users\devkotab\Documents\USDA_Summer_Project\Duck_Clear\Duck_Clear\automatic_dam_split",
+    "out_dir":       r"./output",
     "vector_format": "shp",            # "shp" or "gpkg"
     "write_basin":   True,             # write <basin>_withdams.basin
-    "node_type":     "Junction",       # "Junction" now; "Reservoir" later
+    "node_type":     "Reservoir",      # Insert reservoirs into the basin file
 
     # ---- behavior ---------------------------------------------------
     "filter_dams_to_existing_subbasins": True,
     "dam_filter_buffer": 1000.0,       # map units (EPSG:2276 = ft)
-    "max_snap_distance": 500.0,        # map units
+    "max_snap_distance": 2500.0,        # map units
     "stream_min_value": 0,
     "min_piece_area_mi2": 0.001,
     "flowdir_scheme": "auto",          # "auto" or a name in D8_SCHEMES
@@ -101,6 +87,59 @@ D8_SCHEMES = {
     "ESRI_POWER2":  {1: (0, 1), 2: (1, 1), 4: (1, 0), 8: (1, -1),
                      16: (0, -1), 32: (-1, -1), 64: (-1, 0), 128: (-1, 1)},
 }
+
+# =====================================================================
+# CURVE EXTRACTION (CSVs inside curves.zip: Columns B & F)
+# =====================================================================
+def load_elevation_storage_curves(zip_path):
+    """
+    Parses elevation-storage CSV files from curves.zip.
+    Uses Column B (index 1 = Elevation) and Column F (index 5 = Storage).
+    Returns dict: {dam_id: [(elev1, stor1), (elev2, stor2), ...]}
+    """
+    curves = {}
+    if not zip_path or not os.path.exists(zip_path):
+        print(f"  [Warning] Curves ZIP not found at '{zip_path}'. Skipping curve loading.")
+        return curves
+
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        for name in z.namelist():
+            if name.endswith("_stage_storage.csv") or name.endswith(".csv"):
+                base_name = os.path.basename(name)
+                dam_id = base_name.split("_")[0]
+                
+                try:
+                    with z.open(name) as f:
+                        # Extract Column B (index 1) and Column F (index 5)
+                        df = pd.read_csv(f, usecols=[1, 5], header=0)
+                        df.columns = ["elevation", "storage"]
+                        df["elevation"] = pd.to_numeric(df["elevation"], errors="coerce")
+                        df["storage"] = pd.to_numeric(df["storage"], errors="coerce")
+                        df = df.dropna().sort_values("elevation")
+                        
+                        curves[dam_id] = list(zip(df["elevation"], df["storage"]))
+                except Exception as e:
+                    print(f"  [Warning] Failed to parse curve file {name}: {e}")
+                    
+    print(f"Loaded elevation-storage curves for {len(curves)} dams from zip.")
+    return curves
+
+
+def format_table_block(table_name, curve_points):
+    """Formats elevation-storage curve points into HEC-HMS Table block format."""
+    lines = [
+        f"Table: {table_name}",
+        "     Table Type: Elevation-Storage",
+        "     Unit System: English",
+        "     X-Units: FT",
+        "     Y-Units: AC-FT",
+        "     Data:"
+    ]
+    for elev, stor in curve_points:
+        lines.append(f"          {elev:.2f}, {stor:.2f}")
+    lines.append("End:\n")
+    return "\n".join(lines)
+
 
 # =====================================================================
 # SMALL HELPERS
@@ -134,7 +173,7 @@ def sqmi_factor(crs):
 
 
 # =====================================================================
-# SCHEME DETECTION  (tested: coverage x on-stream x facc-monotonicity)
+# SCHEME DETECTION
 # =====================================================================
 def detect_flowdir_scheme(flowdir, streams_mask, flowaccum, nodata=None,
                           sample_max=200_000, rng_seed=0):
@@ -196,7 +235,7 @@ def detect_flowdir_scheme(flowdir, streams_mask, flowaccum, nodata=None,
 
 
 # =====================================================================
-# DELINEATION / TRACING  (from the dry-run script, verified logic)
+# DELINEATION / TRACING
 # =====================================================================
 def delineate_upstream_mask(flowdir, outlet_rc, d8_map, valid_mask=None):
     nrows, ncols = flowdir.shape
@@ -260,7 +299,7 @@ def find_first_downstream_dam(flowdir, start_rc, d8_map, dam_cell_to_id,
 
 
 # =====================================================================
-# SNAPPING  (tested: max flow accumulation within radius)
+# SNAPPING
 # =====================================================================
 def snap_points_to_flowaccum(dams, streams_path, flowaccum_path,
                              stream_min_value, max_snap_distance):
@@ -294,9 +333,6 @@ def snap_points_to_flowaccum(dams, streams_path, flowaccum_path,
                 stat.append("not_snapped_too_far"); sfac.append(0.0)
                 continue
             fa = facc[gr[in_r], gc[in_r]]
-            # keep the dominant channel (facc >= 50% of max in radius) but
-            # take the NEAREST such cell: rejects wrong small tributaries
-            # without sliding the point downstream along its own channel
             big = fa >= 0.5 * fa.max()
             dd = d[in_r][big]
             k = int(np.argmin(dd))
@@ -365,11 +401,6 @@ def parse_basin_subbasins(text):
 
 
 def match_shp_to_basin(sub, namef, basin_subs):
-    """
-    shapefile subbasin name -> basin element name.
-    Exact match first; otherwise nearest UNUSED basin canvas centroid
-    (handles FlatCk_S001 <-> Subbasin-5 style mismatches).
-    """
     mapping, report = {}, []
     unmatched_shp = []
     used = set()
@@ -416,16 +447,22 @@ def make_subbasin_block(template_block, name, area_mi2, downstream,
     return blk
 
 
-def make_node_block(node_type, name, xy, downstream, desc):
+def make_node_block(node_type, name, xy, downstream, desc, table_name=None):
+    """Formats HEC-HMS node blocks (Reservoir or Junction)."""
     b = (f"{node_type}: {name}\n"
          f"     Description: {desc}\n"
          f"     Canvas X: {xy[0]:.6f}\n"
          f"     Canvas Y: {xy[1]:.6f}\n"
          f"     From Canvas X: {xy[0]:.6f}\n"
          f"     From Canvas Y: {xy[1]:.6f}\n")
+    if node_type == "Reservoir":
+        b += "     Route Method: Outflow Curve\n"
+        if table_name:
+            b += "     Storage Method: Elevation-Storage\n"
+            b += f"     Elevation-Storage Table: {table_name}\n"
     if downstream:
         b += f"     Downstream: {downstream}\n"
-    return b + "End:"
+    return b + "End:\n"
 
 
 def validate_basin_connectivity(text):
@@ -442,7 +479,7 @@ def validate_basin_connectivity(text):
 
 
 # =====================================================================
-# VECTOR WRITER (shp-safe, tested)
+# VECTOR WRITER
 # =====================================================================
 _SHP_RENAMES = {
     "hms_name": "HMS_NAME", "parent": "PARENT", "dam_id": "DAM_ID",
@@ -505,6 +542,9 @@ def main():
     os.makedirs(C["out_dir"], exist_ok=True)
     fmt = C["vector_format"].lower()
 
+    # ---------------- curves loading ---------------------------------
+    dam_curves = load_elevation_storage_curves(C.get("curves_zip", ""))
+
     # ---------------- rasters ----------------------------------------
     flowdir_path = resolve_raster_path(C["terrain_dir"], C["flowdir_name"])
     flowaccum_path = resolve_raster_path(C["terrain_dir"], C["flowaccum_name"])
@@ -523,8 +563,7 @@ def main():
         sdat = src.read(1, masked=True)
         streams_mask = (~sdat.mask) & (sdat.filled(0) > C["stream_min_value"])
     if flowdir.shape != streams_mask.shape or flowdir.shape != flowaccum.shape:
-        raise RuntimeError("flowdir/streams/flowaccum grids differ in shape - "
-                           "they must share one grid")
+        raise RuntimeError("flowdir/streams/flowaccum grids differ in shape")
     cell_area = abs(transform.a * transform.e)
     to_mi2 = sqmi_factor(raster_crs)
     print(f"Grid {flowdir.shape}, cell {abs(transform.a):g} units, "
@@ -537,7 +576,7 @@ def main():
         print("\n" + rep)
     else:
         scheme = C["flowdir_scheme"]
-        print(f"\nUsing configured scheme: {scheme} (set 'auto' to verify)")
+        print(f"\nUsing configured scheme: {scheme}")
     d8_map = D8_SCHEMES[scheme]
     valid_fd = np.isin(flowdir, list(d8_map.keys()))
     if fd_nodata is not None:
@@ -553,8 +592,7 @@ def main():
     idf, namef = C["dam_id_field"], C["subbasin_name_field"]
     for df, fld, what in [(dams, idf, "dam id"), (sub, namef, "subbasin name")]:
         if fld not in df.columns:
-            raise RuntimeError(f"{what} field '{fld}' not in "
-                               f"{list(df.columns)}")
+            raise RuntimeError(f"{what} field '{fld}' not in {list(df.columns)}")
     dams[idf] = dams[idf].astype(str).str.strip()
     sub[namef] = sub[namef].astype(str).str.strip()
     print(f"\nSubbasins: {len(sub)} | dams before filtering: {len(dams)}")
@@ -563,8 +601,7 @@ def main():
     if C["filter_dams_to_existing_subbasins"]:
         wsb = watershed.buffer(C["dam_filter_buffer"])
         dams = dams[dams.geometry.apply(wsb.covers)].copy()
-        print(f"Dams within watershed (+{C['dam_filter_buffer']:g} buffer): "
-              f"{len(dams)}")
+        print(f"Dams within watershed (+{C['dam_filter_buffer']:g} buffer): {len(dams)}")
         if dams.empty:
             raise RuntimeError("no dams remain after watershed filter")
 
@@ -588,13 +625,10 @@ def main():
     bad = snapped[snapped.snap_stat != "snapped"]
     if len(bad):
         print(f"  EXCLUDED {len(bad)} dam(s) with no stream within "
-              f"{C['max_snap_distance']:g} units: "
-              f"{bad[idf].tolist()}")
+              f"{C['max_snap_distance']:g} units: {bad[idf].tolist()}")
     snapped = snapped[snapped.snap_stat == "snapped"].copy()
     if snapped.empty:
         raise RuntimeError("no dams snapped - check streams raster / radius")
-    print(snapped[[idf, "dam_node", "snap_dist", "snap_facc"]]
-          .sort_values("snap_facc", ascending=False).to_string(index=False))
 
     # ---------------- containing subbasin -----------------------------
     join = gpd.sjoin(snapped[[idf, "geometry"]],
@@ -602,10 +636,6 @@ def main():
                      how="left", predicate="within")
     join = join[~join.index.duplicated(keep="first")]
     snapped["parent_sub"] = join[namef].reindex(snapped.index).values
-    lost = snapped[snapped.parent_sub.isna()]
-    if len(lost):
-        print(f"  NOTE: {len(lost)} snapped dam(s) outside all subbasins "
-              f"(edge snap): {lost[idf].tolist()} - excluded")
     inside = snapped.dropna(subset=["parent_sub"]).copy()
     if inside.empty:
         raise RuntimeError("no snapped dams inside subbasins")
@@ -619,18 +649,12 @@ def main():
     cell_to_ids = {}
     for d_id, rc in dam_rc.items():
         cell_to_ids.setdefault(rc, []).append(d_id)
-    for rc, ids in cell_to_ids.items():
-        if len(ids) > 1:
-            print(f"  WARNING: dams share one snapped cell {rc}: {ids}")
     dam_cell_to_id = {rc: ids[0] for rc, ids in cell_to_ids.items()}
 
     # ---------------- nesting via downstream trace -------------------
     parent_dam = {d_id: find_first_downstream_dam(
         flowdir, rc, d8_map, dam_cell_to_id, d_id, C["max_trace_steps"])
         for d_id, rc in dam_rc.items()}
-    print("\nDam nesting (downstream trace):")
-    for d_id in sorted(parent_dam):
-        print(f"  {d_id} -> {parent_dam[d_id] or '(original downstream)'}")
 
     # ---------------- basin parsing + name matching ------------------
     basin_text = read_basin_text(C["basin_file"]) \
@@ -639,55 +663,28 @@ def main():
     if basin_subs:
         name_map, rep = match_shp_to_basin(sub, namef, basin_subs)
         if rep:
-            print("\nShapefile <-> basin element name matching:")
-            print("\n".join(rep))
+            print("\nShapefile <-> basin element name matching:\n" + "\n".join(rep))
     else:
         name_map = {str(r[namef]): str(r[namef]) for _, r in sub.iterrows()}
-        print("\nWARNING: no basin file parsed - downstream names unknown")
 
     def basin_downstream(shp_name):
         bn = name_map.get(str(shp_name))
         return (basin_subs.get(bn, {}) or {}).get("downstream") \
             or "ORIGINAL_DOWNSTREAM"
 
-    # ---------------- optional WBD validation ------------------------
-    if C.get("wbd_shp") and os.path.exists(C["wbd_shp"]):
-        print("\nWBD ground-truth validation (largest dams, full-grid "
-              "delineation vs WBD, both clipped to watershed):")
-        wbd = gpd.read_file(C["wbd_shp"]).to_crs(raster_crs)
-        wbd = fix_geometries(wbd)
-        wbd_d = wbd[wbd[idf].isin(inside[idf])].dissolve(idf)
-        order = wbd_d.geometry.area.sort_values(ascending=False).index[:4]
-        for d_id in order:
-            if d_id not in dam_rc:
-                continue
-            m = delineate_upstream_mask(flowdir, dam_rc[d_id], d8_map,
-                                        valid_mask=valid_fd)
-            g = mask_to_polygon(m, transform)
-            if g is None:
-                print(f"  {d_id}: EMPTY delineation - check snap")
-                continue
-            g = g.intersection(watershed).buffer(0)
-            ref = wbd_d.loc[d_id, "geometry"].intersection(watershed).buffer(0)
-            u = g.union(ref).area
-            iou = g.intersection(ref).area / u if u else 0
-            tag = "" if iou >= 0.70 else "   <-- LOW, investigate"
-            print(f"  {d_id}: delineated {g.area*to_mi2:7.2f} mi2 | "
-                  f"WBD {ref.area*to_mi2:7.2f} mi2 | IoU {iou:.2f}{tag}")
-
     # ---------------- split affected subbasins -----------------------
     print("\nSplitting affected subbasins...")
     split_rows, node_rows, reach_rows, conn_rows = [], [], [], []
-    residual_area = {}          # shp subbasin name -> residual mi2
+    residual_area = {}
     new_basin_blocks = []
     affected = set(inside.parent_sub.astype(str))
 
     for _, sr in sub.iterrows():
         nm = str(sr[namef])
         if nm not in affected:
-            split_rows.append({"hms_name": clean_name(nm), "parent":
-                               clean_name(nm), "dam_id": "", "kind":
-                               "unchanged", "down_to": basin_downstream(nm),
+            split_rows.append({"hms_name": clean_name(nm), "parent": clean_name(nm),
+                               "dam_id": "", "kind": "unchanged",
+                               "down_to": basin_downstream(nm),
                                "area_mi2": sr.geometry.area * to_mi2,
                                "geometry": sr.geometry})
 
@@ -700,19 +697,14 @@ def main():
             r0, r1 = int(win.row_off), int(win.row_off + win.height)
             c0, c1 = int(win.col_off), int(win.col_off + win.width)
             flow_w = flowdir[r0:r1, c0:c1]
-            valid_w = valid_fd[r0:r1, c0:c1] & rasterize_geom(
-                sub_geom, flow_w.shape, wtr)
+            valid_w = valid_fd[r0:r1, c0:c1] & rasterize_geom(sub_geom, flow_w.shape, wtr)
             here = inside[inside.parent_sub.astype(str) == sub_name]
-            print(f"\n  {sub_name}: {len(here)} dam(s)")
 
             up_masks = {}
             for _, dr_ in here.iterrows():
                 d_id = dr_[idf]
                 lrc = (dam_rc[d_id][0] - r0, dam_rc[d_id][1] - c0)
-                up_masks[d_id] = delineate_upstream_mask(
-                    flow_w, lrc, d8_map, valid_mask=valid_w)
-                print(f"    {d_id}: {int(up_masks[d_id].sum()):,} cells "
-                      f"upstream in-subbasin")
+                up_masks[d_id] = delineate_upstream_mask(flow_w, lrc, d8_map, valid_mask=valid_w)
 
             piece_geoms = []
             for _, dr_ in here.iterrows():
@@ -725,31 +717,24 @@ def main():
                         m &= ~up_masks[ch]
                 g = mask_to_polygon(m, wtr)
                 if g is None or g.is_empty:
-                    print(f"    WARNING: empty piece for {d_id}")
                     continue
                 g = g.intersection(sub_geom).buffer(0)
                 a_mi2 = g.area * to_mi2
                 if g.is_empty or a_mi2 < C["min_piece_area_mi2"]:
-                    print(f"    skip tiny piece {d_id} ({a_mi2:.6f} mi2)")
                     continue
 
                 new_sub = clean_name(f"{C['dam_sub_prefix']}{d_id}")
-                # main-stem check: facc-implied drainage vs in-subbasin cum.
                 facc_mi2 = float(dr_["snap_facc"]) * cell_area * to_mi2
                 cum_mi2 = cum_cells * cell_area * to_mi2
-                mainstem = (facc_mi2 > 0 and
-                            cum_mi2 < C["mainstem_area_ratio"] * facc_mi2)
-                node_down = (clean_name(parent_dam[d_id],
-                                        C["dam_node_prefix"])
+                mainstem = (facc_mi2 > 0 and cum_mi2 < C["mainstem_area_ratio"] * facc_mi2)
+                node_down = (clean_name(parent_dam[d_id], C["dam_node_prefix"])
                              if parent_dam.get(d_id)
                              else basin_downstream(sub_name))
 
                 piece_geoms.append(g)
-                split_rows.append({"hms_name": new_sub,
-                                   "parent": clean_name(sub_name),
+                split_rows.append({"hms_name": new_sub, "parent": clean_name(sub_name),
                                    "dam_id": d_id, "kind": "dam_piece",
-                                   "down_to": dam_node, "area_mi2": a_mi2,
-                                   "geometry": g})
+                                   "down_to": dam_node, "area_mi2": a_mi2, "geometry": g})
                 node_rows.append({"node_name": dam_node, "dam_id": d_id,
                                   "parent_sub": clean_name(sub_name),
                                   "parent_dam": parent_dam.get(d_id, ""),
@@ -764,8 +749,7 @@ def main():
                     max_steps=C["max_trace_steps"])
                 if rg is not None:
                     reach_rows.append({"reach": clean_name(f"R_{d_id}"),
-                                       "from_node": dam_node,
-                                       "to_node": node_down,
+                                       "from_node": dam_node, "to_node": node_down,
                                        "dam_id": d_id, "geometry": rg})
                 conn_rows.append({
                     "dam_id": d_id, "dam_node": dam_node,
@@ -778,11 +762,6 @@ def main():
                     "mainstem_flag": "YES" if mainstem else "",
                     "snap_distance": round(float(dr_["snap_dist"]), 3),
                 })
-                if mainstem:
-                    print(f"    ** {d_id}: MAIN-STEM dam - facc-implied "
-                          f"drainage {facc_mi2:.1f} mi2 vs in-subbasin "
-                          f"{cum_mi2:.1f} mi2. Upstream subbasins bypass "
-                          f"this node; review routing manually. **")
 
                 # ---- basin blocks for this dam ----
                 if C["write_basin"] and basin_subs:
@@ -790,22 +769,30 @@ def main():
                     tmpl = basin_subs[bn]["block"] if bn in basin_subs \
                         else next(iter(basin_subs.values()))["block"]
                     cen = g.centroid
-                    lonlat = gpd.GeoSeries([cen], crs=raster_crs) \
-                        .to_crs(4326).iloc[0].coords[0]
+                    lonlat = gpd.GeoSeries([cen], crs=raster_crs).to_crs(4326).iloc[0].coords[0]
+                    
+                    # 1. New Subbasin block
                     new_basin_blocks.append(make_subbasin_block(
                         tmpl, new_sub, a_mi2, dam_node,
                         (cen.x, cen.y), lonlat))
-                    nd = node_down if node_down != "ORIGINAL_DOWNSTREAM" \
-                        else ""
+                    
+                    # 2. Table block (if elevation-storage curve exists)
+                    table_name = f"Table_Elevation_Storage_{d_id}" if d_id in dam_curves else None
+                    if table_name:
+                        tbl_text = format_table_block(table_name, dam_curves[d_id])
+                        new_basin_blocks.append(tbl_text)
+
+                    # 3. Reservoir block
+                    nd = node_down if node_down != "ORIGINAL_DOWNSTREAM" else ""
                     new_basin_blocks.append(make_node_block(
                         C["node_type"], dam_node,
                         (dr_.geometry.x, dr_.geometry.y), nd,
-                        f"Dam node {d_id} (edit routing when ready)"))
+                        f"Dam Reservoir {d_id}",
+                        table_name=table_name))
 
-            # residual keeps ORIGINAL element name (basin-safe)
+            # residual subbasin
             resid = sub_geom.difference(
-                unary_union(piece_geoms).buffer(0)).buffer(0) \
-                if piece_geoms else sub_geom
+                unary_union(piece_geoms).buffer(0)).buffer(0) if piece_geoms else sub_geom
             ra = max(resid.area * to_mi2, 0.0)
             residual_area[sub_name] = ra
             if not resid.is_empty and ra >= C["min_piece_area_mi2"]:
@@ -814,10 +801,6 @@ def main():
                                    "dam_id": "", "kind": "local_resid",
                                    "down_to": basin_downstream(sub_name),
                                    "area_mi2": ra, "geometry": resid})
-            else:
-                print(f"    NOTE: residual of {sub_name} is ~empty "
-                      f"({ra:.6f} mi2); element kept with that area - "
-                      f"consider removing it manually")
 
     # ---------------- write basin file --------------------------------
     if C["write_basin"] and basin_text and new_basin_blocks:
@@ -826,8 +809,7 @@ def main():
             bn = name_map.get(sub_name)
             if bn in basin_subs and np.isfinite(basin_subs[bn]["area"]):
                 old_blk = basin_subs[bn]["block"]
-                out_text = out_text.replace(
-                    old_blk, set_block_area(old_blk, ra), 1)
+                out_text = out_text.replace(old_blk, set_block_area(old_blk, ra), 1)
         insert = "\n\n".join(new_basin_blocks) + "\n"
         anchor = re.search(r"(?m)^Computation Point:", out_text)
         if anchor:
@@ -843,33 +825,21 @@ def main():
         print(f"\nBasin written: {basin_out}")
         print(f"  elements: {n_elem} | unresolved Downstream refs: "
               f"{bad_refs if bad_refs else 'NONE'}")
-        if any(b == "ORIGINAL_DOWNSTREAM" for _, b in bad_refs):
-            print("  !! some nodes point to ORIGINAL_DOWNSTREAM - basin "
-                  "file lacked a downstream for their parent subbasin")
 
     # ---------------- write GIS + CSV --------------------------------
     print("\nWriting GIS outputs...")
     O = C["out_dir"]
     write_vector(gpd.GeoDataFrame(snapped, crs=raster_crs),
                  os.path.join(O, "snapped_dams"), fmt)
-    write_vector(gpd.GeoDataFrame(split_rows, geometry="geometry",
-                                  crs=raster_crs),
+    write_vector(gpd.GeoDataFrame(split_rows, geometry="geometry", crs=raster_crs),
                  os.path.join(O, "proposed_split_subbasins"), fmt)
-    write_vector(gpd.GeoDataFrame(node_rows, geometry="geometry",
-                                  crs=raster_crs),
+    write_vector(gpd.GeoDataFrame(node_rows, geometry="geometry", crs=raster_crs),
                  os.path.join(O, "proposed_dam_nodes"), fmt)
-    write_vector(gpd.GeoDataFrame(reach_rows, geometry="geometry",
-                                  crs=raster_crs),
+    write_vector(gpd.GeoDataFrame(reach_rows, geometry="geometry", crs=raster_crs),
                  os.path.join(O, "proposed_reaches"), fmt)
     conn = pd.DataFrame(conn_rows)
     conn.to_csv(os.path.join(O, "connectivity_check.csv"), index=False)
-    print(f"  wrote {os.path.join(O, 'connectivity_check.csv')}")
-
-    print("\nConnectivity preview:")
-    print(conn.to_string(index=False) if len(conn) else "  (none)")
-    print("\nDone. REMINDER: regenerate area-dependent parameters "
-          "(Snyder Tp, CN, ...) for split subbasins; review any "
-          "MAIN-STEM flags before trusting routing.")
+    print("Done.")
 
 
 if __name__ == "__main__":
